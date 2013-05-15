@@ -4,11 +4,12 @@ import play.api._
 import org.sedis._
 import redis.clients.jedis._
 import play.api.cache._
-import java.util._
 import java.io._
 import biz.source_code.base64Coder._
 import akka.util.ClassLoaderObjectInputStream
-import scala.collection.immutable.MapLike
+
+import ResourceCleanup._
+import ResourceCleanup.IOStreams._
 
 /**
  * provides a redis client and a CachePlugin implementation
@@ -55,43 +56,41 @@ class RedisPlugin(app: Application) extends CachePlugin {
    * value needs be Serializable (a few primitive types are also supported: String, Int, Long, Boolean)
    */
   lazy val api = new CacheAPI {
-    import ResourceCleanup._
+
+    private def withDataOutputStream[U](block: DataOutputStream => U)(implicit out: OutputStream) {
+      using (new DataOutputStream(out)) { dos =>
+        block(dos)
+      }
+    }
+
+    private def withObjectOutputStream[U](block: ObjectOutputStream => U)(implicit out: OutputStream) {
+      using (new ObjectOutputStream(out)) { oos =>
+        block(oos)
+      }
+    }
 
     def set(key: String, value: Any, expiration: Int) {
 
-      try {
-        val baos = new ByteArrayOutputStream()
+      implicit val bos = new ByteArrayOutputStream
 
-        val prefix = value match {
-          case ov: Serializable => using(new ObjectOutputStream(baos)) {
-            oos => oos.writeObject(ov); "oos"
-          }
-          case x => {
-            using(new DataOutputStream(baos)) {
-              dos =>
-                x match {
-                  case v: String => dos.writeUTF(v); "string"
-                  case v: Int => dos.writeInt(v); "int"
-                  case v: Long => dos.writeLong(v); "long"
-                  case v: Boolean => dos.writeBoolean(v); "boolean"
-                  case _ => throw new IOException("could not serialize: " + value.toString)
-                }
-            }
-          }
-        }
-        val redisV = prefix + "-" + String.valueOf(Base64Coder.encode(baos.toByteArray))
-
-        Logger.warn(redisV)
-
-        sedisPool.withJedisClient {
-          client =>
-            client.set(key, redisV)
-            if (expiration != 0) client.expire(key, expiration)
-        }
+      val prefix = value match {
+        case v: String => withDataOutputStream { _.writeUTF(v) }; "string"
+        case v: Int => withDataOutputStream { _.writeInt(v) }; "int"
+        case v: Long => withDataOutputStream { _.writeLong(v) }; "long"
+        case v: Double => withDataOutputStream { _.writeDouble(v) }; "double"
+        case v: Boolean => withDataOutputStream { _.writeBoolean(v) }; "boolean"
+        case v: Serializable => withObjectOutputStream { _.writeObject(v) }; "oos"
+        case _ => throw new IOException("unhandled type: " + value.getClass.getName)
       }
-      catch {
-        case ex: IOException =>
-          Logger.warn("could not serialize key:" + key + " and value:" + value.toString + " ex:" + ex.toString)
+
+      val redisV = prefix + "-" + String.valueOf(Base64Coder.encode(bos.toByteArray))
+
+      Logger.warn(redisV)
+
+      sedisPool.withJedisClient {
+        client =>
+          client.set(key, redisV)
+          if (expiration != 0) client.expire(key, expiration)
       }
     }
 
@@ -102,38 +101,30 @@ class RedisPlugin(app: Application) extends CachePlugin {
     }
 
     def get(key: String): Option[Any] = {
-      try {
-        val data: Seq[String] = sedisPool.withJedisClient { _.get(key) }.split("-")
+      val data: Seq[String] = sedisPool.withJedisClient { _.get(key) }.split("-")
 
-        val bis = new ByteArrayInputStream(Base64Coder.decode(data.last))
+      val bis = new ByteArrayInputStream(Base64Coder.decode(data.last))
 
-        val elem = data.head match {
-          case "oos" =>
-            using(new ClassLoaderObjectInputStream(Play.classloader, bis)) {
-              is => is.readObject
-            }
-          case x => {
-            using(new DataInputStream(bis)) {
-              is => x match {
-                  case "string" => is.readUTF
-                  case "int" => is.readInt
-                  case "long" => is.readLong
-                  case "boolean" => is.readBoolean
-                  case _ => throw new IOException("can not recognize value")
-                }
-            }
+      val elem = data.head match {
+        case "oos" =>
+          using(new ClassLoaderObjectInputStream(Play.classloader, bis)) {
+            is => is.readObject
+          }
+        case x => {
+          using(new DataInputStream(bis)) {
+            is => x match {
+                case "string" => is.readUTF
+                case "int" => is.readInt
+                case "long" => is.readLong
+                case "double" => is.readDouble
+                case "boolean" => is.readBoolean
+                case _ => throw new IOException("can not recognize value")
+              }
           }
         }
-
-        Some(elem)
-
       }
-      catch {
-        case ex: Exception =>
-          Logger.warn("could not deserialisze key:" + key + " ex:" + ex.toString)
-          ex.printStackTrace()
-          None
-      }
+
+      Some(elem)
     }
   }
 }
