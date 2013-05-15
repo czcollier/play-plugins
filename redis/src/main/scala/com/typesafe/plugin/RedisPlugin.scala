@@ -47,27 +47,6 @@ class RedisPlugin(app: Application) extends CachePlugin {
     !app.configuration.getString("redisplugin").filter(_ == "disabled").isDefined
   }
 
-
-  type Flushable = Closeable { def flush() }
-
-  trait CanCleanup[-T] { def cleanup(x: T) }
-
-  implicit object CanCleanupCloseable extends CanCleanup[Closeable] {
-    def cleanup(cl: Closeable) { cl.close() }
-  }
-
-//  implicit object CanCleanupFlushable extends CanCleanup[Flushable] {
-//    def cleanup(fl: Flushable) { fl.close(); fl.flush() }
-//  }
-
-  def using[T, U](resource: T)(block: T => U)(implicit cleaner: CanCleanup[T]): U = {
-    try {
-      block(resource)
-    } finally {
-      if (resource != null) cleaner.cleanup(resource)
-    }
-  }
-
   class PlayObjectInputStream(is: InputStream)(implicit app: play.Application) extends ClassLoaderObjectInputStream(Play.classloader, is)
 
   /**
@@ -76,6 +55,7 @@ class RedisPlugin(app: Application) extends CachePlugin {
    * value needs be Serializable (a few primitive types are also supported: String, Int, Long, Boolean)
    */
   lazy val api = new CacheAPI {
+    import ResourceCleanup._
 
     def set(key: String, value: Any, expiration: Int) {
 
