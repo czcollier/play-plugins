@@ -10,6 +10,7 @@ import akka.util.ClassLoaderObjectInputStream
 
 import ResourceCleanup._
 import ResourceCleanup.IOStreams._
+import org.slf4j.LoggerFactory
 
 /**
  * provides a redis client and a CachePlugin implementation
@@ -19,7 +20,7 @@ import ResourceCleanup.IOStreams._
  */
 class RedisPlugin(app: Application) extends CachePlugin {
 
-  import play.api.Play.current
+  val logger = LoggerFactory.getLogger(classOf[RedisPlugin])
 
   private lazy val host = app.configuration.getString("redis.host").getOrElse("localhost")
   private lazy val port = app.configuration.getInt("redis.port").getOrElse(6379)
@@ -48,8 +49,6 @@ class RedisPlugin(app: Application) extends CachePlugin {
     !app.configuration.getString("redisplugin").filter(_ == "disabled").isDefined
   }
 
-  class PlayObjectInputStream(is: InputStream)(implicit app: play.Application) extends ClassLoaderObjectInputStream(Play.classloader, is)
-
   /**
    * cacheAPI implementation
    * can serialize, deserialize to/from redis
@@ -57,35 +56,42 @@ class RedisPlugin(app: Application) extends CachePlugin {
    */
   lazy val api = new CacheAPI {
 
-    private def withDataOutputStream[U](block: DataOutputStream => U)(implicit out: OutputStream) {
-      using (new DataOutputStream(out)) { dos =>
-        block(dos)
-      }
+    private def withDataOutputStream[U](block: DataOutputStream => U) = {
+      val bos = new ByteArrayOutputStream
+      using (new DataOutputStream(new ByteArrayOutputStream)) { dos => block(dos) }
+      bos.toByteArray
     }
 
-    private def withObjectOutputStream[U](block: ObjectOutputStream => U)(implicit out: OutputStream) {
-      using (new ObjectOutputStream(out)) { oos =>
-        block(oos)
-      }
+    private def withObjectOutputStream[U](block: ObjectOutputStream => U) = {
+      val bos = new ByteArrayOutputStream
+      using (new ObjectOutputStream(bos)) { oos => block(oos) }
+      bos.toByteArray
+    }
+
+    private def withDataInputStream[U](block: DataInputStream => U)(implicit in: InputStream) = {
+      using (new DataInputStream(in)) { dis => block(dis) }
+    }
+
+    private def withObjectInputStream[U](block: ObjectInputStream => U)(implicit in: InputStream) = {
+      using (new ClassLoaderObjectInputStream(app.classloader, in)) { ois => block(ois) }
     }
 
     def set(key: String, value: Any, expiration: Int) {
 
-      implicit val bos = new ByteArrayOutputStream
-
-      val prefix = value match {
-        case v: String => withDataOutputStream { _.writeUTF(v) }; "string"
-        case v: Int => withDataOutputStream { _.writeInt(v) }; "int"
-        case v: Long => withDataOutputStream { _.writeLong(v) }; "long"
-        case v: Double => withDataOutputStream { _.writeDouble(v) }; "double"
-        case v: Boolean => withDataOutputStream { _.writeBoolean(v) }; "boolean"
-        case v: Serializable => withObjectOutputStream { _.writeObject(v) }; "oos"
+      val (data, prefix) = value match {
+        case v: String => (withDataOutputStream { _.writeUTF(v) }, "string")
+        case v: Int => (withDataOutputStream { _.writeInt(v) }, "int")
+        case v: Long => (withDataOutputStream { _.writeLong(v) }, "long")
+        case v: Double => (withDataOutputStream { _.writeDouble(v) }, "double")
+        case v: Boolean => (withDataOutputStream { _.writeBoolean(v) }, "boolean")
+        case v: Serializable => (withObjectOutputStream { _.writeObject(v) }, "oos")
         case _ => throw new IOException("unhandled type: " + value.getClass.getName)
       }
 
-      val redisV = prefix + "-" + String.valueOf(Base64Coder.encode(bos.toByteArray))
+      val redisV = prefix + "-" + String.valueOf(Base64Coder.encode(data))
 
-      Logger.warn(redisV)
+      if (logger.isDebugEnabled)
+        logger.debug("inserting: %s => %s".format(key, truncateForLog(redisV, 100)))
 
       sedisPool.withJedisClient {
         client =>
@@ -101,30 +107,39 @@ class RedisPlugin(app: Application) extends CachePlugin {
     }
 
     def get(key: String): Option[Any] = {
-      val data: Seq[String] = sedisPool.withJedisClient { _.get(key) }.split("-")
+      val rawData = sedisPool.withJedisClient { _.get(key) }
 
-      val bis = new ByteArrayInputStream(Base64Coder.decode(data.last))
+      if (logger.isDebugEnabled)
+        logger.debug("fetched raw data: %s => %s".format(key, truncateForLog(rawData, 100)))
 
-      val elem = data.head match {
-        case "oos" =>
-          using(new ClassLoaderObjectInputStream(Play.classloader, bis)) {
-            is => is.readObject
-          }
-        case x => {
-          using(new DataInputStream(bis)) {
-            is => x match {
-                case "string" => is.readUTF
-                case "int" => is.readInt
-                case "long" => is.readLong
-                case "double" => is.readDouble
-                case "boolean" => is.readBoolean
-                case _ => throw new IOException("can not recognize value")
-              }
-          }
-        }
+      val (prefix, value) = rawData.split("-") match {
+        case Array(t, v) => (t, v)
+        case _ => throw new IOException("badly formatted value at key: %s".format(key))
       }
 
+      implicit val bis = new ByteArrayInputStream(Base64Coder.decode(value))
+
+      val elem = prefix match {
+        case "string" => withDataInputStream(_.readUTF)
+        case "int" => withDataInputStream(_.readInt)
+        case "long" => withDataInputStream(_.readLong)
+        case "double" => withDataInputStream(_.readDouble)
+        case "boolean" => withDataInputStream(_.readBoolean)
+        case "oos" => withObjectInputStream(_.readObject)
+        case x => throw new IOException("unhandled type: '%s' at key '%s'".format(x, key))
+      }
+
+      if (logger.isDebugEnabled)
+        logger.debug("fetched: %s: %s".format(elem.getClass.getName, elem))
+
       Some(elem)
+    }
+
+    private def truncateForLog(sv: String, size: Int) = {
+      if (sv.length > size)
+        "%s ... (truncated to first %d elements)".format(sv.substring(0, size), size)
+      else
+        sv
     }
   }
 }
