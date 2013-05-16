@@ -58,7 +58,7 @@ class RedisPlugin(app: Application) extends CachePlugin {
 
     private def withDataOutputStream[U](block: DataOutputStream => U) = {
       val bos = new ByteArrayOutputStream
-      using (new DataOutputStream(new ByteArrayOutputStream)) { dos => block(dos) }
+      using (new DataOutputStream(bos)) { dos => block(dos) }
       bos.toByteArray
     }
 
